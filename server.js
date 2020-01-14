@@ -6,6 +6,9 @@ import http from 'http';
 import { hri } from 'human-readable-ids';
 import Router from 'koa-router';
 
+var EdDSA = require('elliptic').eddsa;
+var base32decode = require('base32-decode');
+
 import ClientManager from './lib/ClientManager';
 
 const debug = Debug('localtunnel:server');
@@ -84,6 +87,8 @@ export default function(opt) {
     app.use(async (ctx, next) => {
         const parts = ctx.request.path.split('/');
 
+        // TODO: Need challenge string
+
         // any request with several layers of paths is not allowed
         // rejects /foo/bar
         // allow /foo
@@ -97,6 +102,45 @@ export default function(opt) {
         // limit requested hostnames to 63 characters
         if (! /^(?:[a-z0-9][a-z0-9\-]{4,63}[a-z0-9]|[a-z0-9]{4,63})$/.test(reqId)) {
             const msg = 'Invalid subdomain. Subdomains must be lowercase and between 4 and 63 alphanumeric characters.';
+            ctx.status = 403;
+            ctx.body = {
+                message: msg,
+            };
+            return;
+        }
+
+        var signature = null;
+        var challenge = null;
+        for (var i = 0; i < ctx.request.req.rawHeaders.length; i += 2) {
+            if (ctx.request.req.rawHeaders[i] == 'signature') {
+                signature = ctx.request.req.rawHeaders[i + 1];
+            } else if (ctx.request.req.rawHeaders[i] == 'challenge') {
+                challenge = ctx.request.req.rawHeaders[i + 1];
+            }
+        }
+
+        if (challenge == null) {
+            const new_challenge = manager.newChallenge(reqId);
+            ctx.body = {
+                challenge: new_challenge,
+            };
+            return;
+        }
+
+        if (challenge != manager.getChallenge(reqId)) {
+            const msg = 'Invalid challenge.';
+            ctx.status = 403;
+            ctx.body = {
+                message: msg,
+            };
+            return;
+        }
+        
+        var address = base32decode(reqId, 'RFC4648').slice(0, 32);
+
+        var ec = new EdDSA('ed25519');
+        if (!ec.verify(challenge, signature, address)) {
+            const msg = 'Invalid signature.';
             ctx.status = 403;
             ctx.body = {
                 message: msg,
