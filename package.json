@@ -20,6 +20,7 @@
     "localenv": "0.2.2",
     "optimist": "0.6.1",
     "pump": "3.0.0",
+    "socks5-http-client": "1.0.4",
     "tldjs": "2.3.1"
   },
   "devDependencies": {
@@ -30,7 +31,7 @@
   },
   "scripts": {
     "test": "mocha --check-leaks --require esm './**/*.test.js'",
-    "start": "./bin/server --port 8650",
+    "start": "./bin/server",
     "dev": "node-dev bin/server --port 3000"
   }
 }

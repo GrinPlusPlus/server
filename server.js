@@ -1,38 +1,16 @@
-import log from 'book';
 import Koa from 'koa';
 import tldjs from 'tldjs';
-import Debug from 'debug';
 import http from 'http';
-import { hri } from 'human-readable-ids';
 import Router from 'koa-router';
-
-var EdDSA = require('elliptic').eddsa;
-var base32decode = require('base32-decode');
-
 import ClientManager from './lib/ClientManager';
+import { Address, createAddress } from './lib/Address';
 
-const debug = Debug('localtunnel:server');
-
-export default function(opt) {
-    opt = opt || {};
-
-    const validHosts = (opt.domain) ? [opt.domain] : undefined;
-    const myTldjs = tldjs.fromUserSettings({ validHosts });
-    const landingPage = opt.landing || 'https://localtunnel.github.io/www/';
-
-    function GetClientIdFromHostname(hostname) {
-        return myTldjs.getSubdomain(hostname);
-    }
-
-    const manager = new ClientManager(opt);
-
-    const schema = opt.secure ? 'https' : 'http';
-
+function setupAPIs(clientManager) {
     const app = new Koa();
     const router = new Router();
 
     router.get('/api/status', async (ctx, next) => {
-        const stats = manager.stats;
+        const stats = clientManager.stats;
         ctx.body = {
             tunnels: stats.tunnels,
             mem: process.memoryUsage(),
@@ -41,7 +19,7 @@ export default function(opt) {
 
     router.get('/api/tunnels/:id/status', async (ctx, next) => {
         const clientId = ctx.params.id;
-        const client = manager.getClient(clientId);
+        const client = clientManager.getClient(clientId);
         if (!client) {
             ctx.throw(404);
             return;
@@ -56,111 +34,14 @@ export default function(opt) {
     app.use(router.routes());
     app.use(router.allowedMethods());
 
-    // root endpoint
-    app.use(async (ctx, next) => {
-        const path = ctx.request.path;
+    return app;
+}
 
-        // skip anything not on the root path
-        if (path !== '/') {
-            await next();
-            return;
-        }
-
-        const isNewClientRequest = ctx.query['new'] !== undefined;
-        if (isNewClientRequest) {
-            const reqId = hri.random();
-            debug('making new client with id %s', reqId);
-            const info = await manager.newClient(reqId);
-
-            const url = schema + '://' + info.id + '.' + ctx.request.host;
-            info.url = url;
-            ctx.body = info;
-            return;
-        }
-
-        // no new client request, send to landing page
-        ctx.redirect(landingPage);
-    });
-
-    // anything after the / path is a request for a specific client name
-    // This is a backwards compat feature
-    app.use(async (ctx, next) => {
-        const parts = ctx.request.path.split('/');
-
-        // TODO: Need challenge string
-
-        // any request with several layers of paths is not allowed
-        // rejects /foo/bar
-        // allow /foo
-        if (parts.length !== 2) {
-            await next();
-            return;
-        }
-
-        const reqId = parts[1];
-
-        // limit requested hostnames to 63 characters
-        if (! /^(?:[a-z0-9][a-z0-9\-]{4,63}[a-z0-9]|[a-z0-9]{4,63})$/.test(reqId)) {
-            const msg = 'Invalid subdomain. Subdomains must be lowercase and between 4 and 63 alphanumeric characters.';
-            ctx.status = 403;
-            ctx.body = {
-                message: msg,
-            };
-            return;
-        }
-
-        var signature = null;
-        var challenge = null;
-        for (var i = 0; i < ctx.request.req.rawHeaders.length; i += 2) {
-            if (ctx.request.req.rawHeaders[i] == 'signature') {
-                signature = ctx.request.req.rawHeaders[i + 1];
-            } else if (ctx.request.req.rawHeaders[i] == 'challenge') {
-                challenge = ctx.request.req.rawHeaders[i + 1];
-            }
-        }
-
-        if (challenge == null) {
-            const new_challenge = manager.newChallenge(reqId);
-            ctx.body = {
-                challenge: new_challenge,
-            };
-            return;
-        }
-
-        if (challenge != manager.getChallenge(reqId)) {
-            const msg = 'Invalid challenge.';
-            ctx.status = 403;
-            ctx.body = {
-                message: msg,
-            };
-            return;
-        }
-        
-        var address = base32decode(reqId, 'RFC4648').slice(0, 32);
-
-        var ec = new EdDSA('ed25519');
-        if (!ec.verify(challenge, signature, address)) {
-            const msg = 'Invalid signature.';
-            ctx.status = 403;
-            ctx.body = {
-                message: msg,
-            };
-            return;
-        }
-
-        debug('making new client with id %s', reqId);
-        const info = await manager.newClient(reqId);
-
-        const url = schema + '://' + info.id + '.' + ctx.request.host;
-        info.url = url;
-        ctx.body = info;
-        return;
-    });
+function startServer(opt, clientManager, appCallback) {
+    const validHosts = (opt.domain) ? [opt.domain] : undefined;
+    const myTldjs = tldjs.fromUserSettings({ validHosts });
 
     const server = http.createServer();
-
-    const appCallback = app.callback();
-
     server.on('request', (req, res) => {
         // without a hostname, we won't know who the request is for
         const hostname = req.headers.host;
@@ -170,13 +51,19 @@ export default function(opt) {
             return;
         }
 
-        const clientId = GetClientIdFromHostname(hostname);
+        const clientId = myTldjs.getSubdomain(hostname);
         if (!clientId) {
             appCallback(req, res);
             return;
         }
 
-        const client = manager.getClient(clientId);
+        const address = createAddress(clientId);
+        if (address == null) {
+            appCallback(req, res);
+            return;
+        }
+
+        const client = await clientManager.getClient(address.get());
         if (!client) {
             res.statusCode = 404;
             res.end('404');
@@ -186,27 +73,16 @@ export default function(opt) {
         client.handleRequest(req, res);
     });
 
-    server.on('upgrade', (req, socket, head) => {
-        const hostname = req.headers.host;
-        if (!hostname) {
-            socket.destroy();
-            return;
-        }
-
-        const clientId = GetClientIdFromHostname(hostname);
-        if (!clientId) {
-            socket.destroy();
-            return;
-        }
-
-        const client = manager.getClient(clientId);
-        if (!client) {
-            socket.destroy();
-            return;
-        }
-
-        client.handleUpgrade(req, socket);
-    });
-
     return server;
+}
+
+export default function(opt) {
+    opt = opt || {};
+
+    const manager = new ClientManager(opt);
+
+    const app = setupAPIs(manager);
+    const appCallback = app.callback();
+
+    return startServer(opt, manager, appCallback);
 };
