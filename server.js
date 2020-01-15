@@ -63,7 +63,7 @@ function startServer(opt, clientManager, appCallback) {
             return;
         }
 
-        const client = await clientManager.getClient(address.get());
+        const client = clientManager.getClient(address.get());
         if (!client) {
             res.statusCode = 404;
             res.end('404');
